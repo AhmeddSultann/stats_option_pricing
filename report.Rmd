@@ -1,0 +1,443 @@
+---
+title: "MATH60633A – TP2: Options Risk Management"
+author: "Team"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+    number_sections: true
+    latex_engine: xelatex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 8, fig.height = 5)
+set.seed(42)
+```
+
+# 0. Data Loading & Exploration
+
+```{r load-data}
+library(xts)
+library(MASS)
+
+source("R/functions.R")
+load("Market.rda")
+
+# Extract key objects
+S0      <- as.numeric(tail(Market$sp500, 1))
+vix0    <- as.numeric(tail(Market$vix, 1))
+rf_mats <- as.numeric(names(Market$rf))
+rf_vals <- as.numeric(Market$rf)
+
+cat("Latest S&P 500 price:", S0, "\n")
+cat("Latest VIX (decimal):", vix0, "(", vix0 * 100, "%)\n")
+```
+
+```{r explore-data, fig.height=8}
+par(mfrow = c(2, 2))
+
+# S&P 500 time series
+plot(Market$sp500, main = "S&P 500 Index", ylab = "Price", col = "steelblue")
+
+# VIX time series
+plot(Market$vix, main = "VIX Index", ylab = "Volatility (decimal)", col = "darkred")
+
+# Term structure
+plot(rf_mats, rf_vals, type = "b", pch = 19, col = "darkgreen",
+     xlab = "Maturity (years)", ylab = "Rate",
+     main = "Current Term Structure")
+grid()
+
+# Options implied volatility vs moneyness
+m_calls <- Market$calls[, "K"] / S0
+m_puts  <- Market$puts[, "K"] / S0
+plot(m_calls, Market$calls[, "IV"], pch = 16, cex = 0.5, col = "blue",
+     xlab = "Moneyness (K/S)", ylab = "Implied Volatility",
+     main = "Market Implied Volatilities", xlim = range(c(m_calls, m_puts)))
+points(m_puts, Market$puts[, "IV"], pch = 16, cex = 0.5, col = "red")
+legend("topright", legend = c("Calls", "Puts"), col = c("blue", "red"), pch = 16)
+```
+
+# 1. Pricing the Portfolio of Options [5 pts]
+
+We define a book of four European call options:
+
+| Option | Strike (K) | Maturity (days) |
+|--------|-----------|-----------------|
+| 1      | 1600      | 20              |
+| 2      | 1650      | 20              |
+| 3      | 1750      | 40              |
+| 4      | 1800      | 40              |
+
+**Conventions**: 360 days/year for the term structure, 250 days/year for option maturity.
+
+```{r section1-pricing}
+# Interpolated rates
+r_20d <- interpolate_rate(rf_mats, rf_vals, 20 / 360)
+r_40d <- interpolate_rate(rf_mats, rf_vals, 40 / 360)
+cat("Interpolated rate (20-day):", r_20d, "\n")
+cat("Interpolated rate (40-day):", r_40d, "\n")
+
+# Option time-to-maturity
+tau1 <- 20 / 250
+tau2 <- 40 / 250
+cat("tau_opt (20-day):", tau1, "years\n")
+cat("tau_opt (40-day):", tau2, "years\n")
+
+# Price each option using Black-Scholes with VIX as implied vol
+c1 <- bs_call(S0, 1600, r_20d, vix0, tau1)
+c2 <- bs_call(S0, 1650, r_20d, vix0, tau1)
+c3 <- bs_call(S0, 1750, r_40d, vix0, tau2)
+c4 <- bs_call(S0, 1800, r_40d, vix0, tau2)
+
+# Portfolio value
+V0 <- c1 + c2 + c3 + c4
+
+cat("\n--- Individual Option Prices ---\n")
+cat("C(K=1600, T=20d):", round(c1, 4), "\n")
+cat("C(K=1650, T=20d):", round(c2, 4), "\n")
+cat("C(K=1750, T=40d):", round(c3, 4), "\n")
+cat("C(K=1800, T=40d):", round(c4, 4), "\n")
+cat("\nPortfolio value V0:", round(V0, 4), "\n")
+```
+
+# 2. One Risk Driver — Univariate Gaussian Model [10 pts]
+
+We model the daily log-returns of the S&P 500 as iid normally distributed. We simulate
+10,000 scenarios for the one-week ahead (5 business days) underlying price.
+
+```{r section2-fit}
+# Daily log-returns of S&P 500
+sp_logret <- diff(log(as.numeric(Market$sp500)))
+
+mu_sp    <- mean(sp_logret)
+sigma_sp <- sd(sp_logret)
+
+cat("Daily log-return mean:", mu_sp, "\n")
+cat("Daily log-return std: ", sigma_sp, "\n")
+cat("Number of observations:", length(sp_logret), "\n")
+```
+
+```{r section2-simulate}
+n_sim  <- 10000
+n_days <- 5
+
+# Simulate 5 daily log-returns per scenario, then sum
+Z_sp <- matrix(rnorm(n_sim * n_days, mean = mu_sp, sd = sigma_sp),
+               nrow = n_sim, ncol = n_days)
+cum_logret_sp <- rowSums(Z_sp)
+
+# Project S&P price one week ahead
+S_T5 <- S0 * exp(cum_logret_sp)
+```
+
+```{r section2-pnl}
+# Re-price portfolio at T+5: maturities decrease by 5 days
+# VIX stays constant (single risk driver model)
+V_T5 <- portfolio_value(S_T5, vix0, rf_mats, rf_vals, days1 = 15, days2 = 35)
+
+PnL_uni <- V_T5 - V0
+
+# Risk measures
+VaR95_uni <- -quantile(PnL_uni, 0.05)
+ES95_uni  <- -mean(PnL_uni[PnL_uni <= -VaR95_uni])
+
+cat("--- Univariate Gaussian Risk Measures ---\n")
+cat("VaR 95%:", round(VaR95_uni, 4), "\n")
+cat("ES  95%:", round(ES95_uni, 4), "\n")
+```
+
+```{r section2-plot}
+hist(PnL_uni, breaks = 80, col = "lightblue", border = "white",
+     main = "P&L Distribution — Univariate Gaussian",
+     xlab = "P&L", probability = TRUE)
+abline(v = -VaR95_uni, col = "red", lwd = 2, lty = 2)
+abline(v = -ES95_uni, col = "darkred", lwd = 2, lty = 1)
+legend("topleft", legend = c(paste("VaR 95% =", round(VaR95_uni, 2)),
+                              paste("ES 95%  =", round(ES95_uni, 2))),
+       col = c("red", "darkred"), lwd = 2, lty = c(2, 1))
+```
+
+# 3. Two Risk Drivers — Bivariate Gaussian Model [15 pts]
+
+We add the VIX as a second risk driver. Both daily log-returns are modeled as
+jointly normally distributed.
+
+```{r section3-fit}
+# Daily log-returns of VIX
+vix_logret <- diff(log(as.numeric(Market$vix)))
+
+mu_vix    <- mean(vix_logret)
+sigma_vix <- sd(vix_logret)
+rho_biv   <- cor(sp_logret, vix_logret)
+
+cat("VIX log-return mean:", mu_vix, "\n")
+cat("VIX log-return std: ", sigma_vix, "\n")
+cat("Correlation (S&P, VIX):", rho_biv, "\n")
+```
+
+```{r section3-simulate}
+mu_vec    <- c(mu_sp, mu_vix)
+Sigma_mat <- matrix(c(sigma_sp^2,                      rho_biv * sigma_sp * sigma_vix,
+                      rho_biv * sigma_sp * sigma_vix,  sigma_vix^2),
+                    nrow = 2)
+
+# Simulate 5 days of bivariate normal draws
+Z_biv <- array(0, dim = c(n_sim, n_days, 2))
+for (d in 1:n_days) {
+  Z_biv[, d, ] <- mvrnorm(n_sim, mu = mu_vec, Sigma = Sigma_mat)
+}
+
+# Cumulative 5-day log-returns
+cum_sp_biv  <- rowSums(Z_biv[, , 1])
+cum_vix_biv <- rowSums(Z_biv[, , 2])
+
+# Project prices
+S_T5_biv   <- S0   * exp(cum_sp_biv)
+VIX_T5_biv <- vix0 * exp(cum_vix_biv)
+```
+
+```{r section3-pnl}
+# Price portfolio at T+5 with simulated VIX as implied vol
+V_T5_biv <- portfolio_value(S_T5_biv, VIX_T5_biv, rf_mats, rf_vals,
+                            days1 = 15, days2 = 35)
+PnL_biv  <- V_T5_biv - V0
+
+VaR95_biv <- -quantile(PnL_biv, 0.05)
+ES95_biv  <- -mean(PnL_biv[PnL_biv <= -VaR95_biv])
+
+cat("--- Bivariate Gaussian Risk Measures ---\n")
+cat("VaR 95%:", round(VaR95_biv, 4), "\n")
+cat("ES  95%:", round(ES95_biv, 4), "\n")
+```
+
+```{r section3-plot}
+hist(PnL_biv, breaks = 80, col = "lightyellow", border = "white",
+     main = "P&L Distribution — Bivariate Gaussian",
+     xlab = "P&L", probability = TRUE)
+abline(v = -VaR95_biv, col = "red", lwd = 2, lty = 2)
+abline(v = -ES95_biv, col = "darkred", lwd = 2, lty = 1)
+legend("topleft", legend = c(paste("VaR 95% =", round(VaR95_biv, 2)),
+                              paste("ES 95%  =", round(ES95_biv, 2))),
+       col = c("red", "darkred"), lwd = 2, lty = c(2, 1))
+```
+
+# 4. Two Risk Drivers — Copula-Marginal Model [20 pts]
+
+We use Student-t marginals ($\nu = 10$ for S&P, $\nu = 5$ for VIX) with a Gaussian
+copula to capture the dependence structure while allowing heavier tails.
+
+```{r section4-fit-copula}
+# Estimate Gaussian copula correlation via Kendall's tau inversion
+rho_cop <- fit_gauss_copula(sp_logret, vix_logret)
+cat("Kendall's tau:", cor(sp_logret, vix_logret, method = "kendall"), "\n")
+cat("Fitted Gaussian copula correlation:", rho_cop, "\n")
+```
+
+```{r section4-simulate}
+df_sp  <- 10
+df_vix <- 5
+
+# Standard deviations of Student-t distributions
+sd_t_sp  <- sqrt(df_sp / (df_sp - 2))    # sqrt(10/8)
+sd_t_vix <- sqrt(df_vix / (df_vix - 2))  # sqrt(5/3)
+
+# Simulate 5 days of copula-based draws
+Z_cop <- array(0, dim = c(n_sim, n_days, 2))
+for (d in 1:n_days) {
+  U_sim <- rgauss_copula(n_sim, rho_cop)
+
+  # Transform to Student-t marginals
+  z1_raw <- qt(U_sim[, 1], df = df_sp)
+  z2_raw <- qt(U_sim[, 2], df = df_vix)
+
+  # Scale to match data mean and standard deviation
+  z1_scaled <- mu_sp  + (sigma_sp  / sd_t_sp)  * z1_raw
+  z2_scaled <- mu_vix + (sigma_vix / sd_t_vix) * z2_raw
+
+  Z_cop[, d, ] <- cbind(z1_scaled, z2_scaled)
+}
+
+# Cumulative 5-day log-returns
+cum_sp_cop  <- rowSums(Z_cop[, , 1])
+cum_vix_cop <- rowSums(Z_cop[, , 2])
+
+# Project prices
+S_T5_cop   <- S0   * exp(cum_sp_cop)
+VIX_T5_cop <- vix0 * exp(cum_vix_cop)
+```
+
+```{r section4-pnl}
+V_T5_cop <- portfolio_value(S_T5_cop, VIX_T5_cop, rf_mats, rf_vals,
+                            days1 = 15, days2 = 35)
+PnL_cop  <- V_T5_cop - V0
+
+VaR95_cop <- -quantile(PnL_cop, 0.05)
+ES95_cop  <- -mean(PnL_cop[PnL_cop <= -VaR95_cop])
+
+cat("--- Copula-Marginal Risk Measures ---\n")
+cat("VaR 95%:", round(VaR95_cop, 4), "\n")
+cat("ES  95%:", round(ES95_cop, 4), "\n")
+```
+
+```{r section4-plot}
+hist(PnL_cop, breaks = 80, col = "lavender", border = "white",
+     main = "P&L Distribution — Copula + Student-t Marginals",
+     xlab = "P&L", probability = TRUE)
+abline(v = -VaR95_cop, col = "red", lwd = 2, lty = 2)
+abline(v = -ES95_cop, col = "darkred", lwd = 2, lty = 1)
+legend("topleft", legend = c(paste("VaR 95% =", round(VaR95_cop, 2)),
+                              paste("ES 95%  =", round(ES95_cop, 2))),
+       col = c("red", "darkred"), lwd = 2, lty = c(2, 1))
+```
+
+# 5. Volatility Surface [20 pts]
+
+## 5.1 Fit the Parametric Surface
+
+We fit the parametric volatility surface:
+$$\sigma(m, \tau) = \alpha_1 + \alpha_2 (m-1)^2 + \alpha_3 (m-1)^3 + \alpha_4 \sqrt{\tau}$$
+where $m = K/S$ is moneyness and $\tau$ is time to maturity in years.
+We minimize the sum of absolute deviations between market and model implied volatilities.
+
+```{r section5-fit}
+# Combine calls and puts
+all_opts <- rbind(Market$calls, Market$puts)
+K_all    <- all_opts[, "K"]
+tau_all  <- all_opts[, "tau"]
+IV_all   <- all_opts[, "IV"]
+m_all    <- K_all / S0
+
+cat("Total options for surface fitting:", nrow(all_opts), "\n")
+cat("Unique maturities:", length(unique(tau_all)), "\n")
+cat("Moneyness range:", round(range(m_all), 4), "\n")
+
+# L1 objective function
+obj_fn <- function(alpha) {
+  sigma_model <- alpha[1] + alpha[2] * (m_all - 1)^2 +
+                 alpha[3] * (m_all - 1)^3 + alpha[4] * sqrt(tau_all)
+  sum(abs(IV_all - sigma_model))
+}
+
+# Optimize with Nelder-Mead
+fit_surface <- optim(par = c(0.15, 0.5, -0.1, 0.05), fn = obj_fn,
+                     method = "Nelder-Mead",
+                     control = list(maxit = 50000))
+
+alpha <- fit_surface$par
+cat("\nFitted parameters:\n")
+cat("  alpha1:", alpha[1], "\n")
+cat("  alpha2:", alpha[2], "\n")
+cat("  alpha3:", alpha[3], "\n")
+cat("  alpha4:", alpha[4], "\n")
+cat("  Convergence:", fit_surface$convergence, "\n")
+```
+
+```{r section5-surface-plot}
+# Plot fitted vs. market implied vols
+IV_fitted <- sigma_hat(m_all, tau_all, alpha)
+resid     <- IV_all - IV_fitted
+
+par(mfrow = c(1, 2))
+plot(IV_all, IV_fitted, pch = 16, cex = 0.3, col = "steelblue",
+     xlab = "Market IV", ylab = "Model IV",
+     main = "Fitted vs. Market IV")
+abline(0, 1, col = "red", lwd = 2)
+
+hist(resid, breaks = 60, col = "lightgray", border = "white",
+     main = "Residuals (Market - Model)", xlab = "Residual")
+abline(v = 0, col = "red", lwd = 2)
+```
+
+## 5.2 Re-price Portfolio Using the Volatility Surface
+
+At time $T$, we use:
+$$\tilde{\sigma}(m, \tau) = \sigma(m, \tau) - (\alpha_1 + \alpha_4) + \text{VIX}_T$$
+
+At time $T+5$, we use:
+$$\tilde{\sigma}(m, \tau) = \sigma(m, \tau) - (\alpha_1 + \alpha_4) + \text{VIX}_{T+5}$$
+where $\text{VIX}_{T+5}$ is obtained by simulation (copula model from Section 4).
+
+```{r section5-reprice}
+# Portfolio value at T using volatility surface
+V0_surf <- portfolio_value_surface(S0, vix0, rf_mats, rf_vals,
+                                   days1 = 20, days2 = 40, alpha = alpha)
+cat("Portfolio value at T (surface):", round(V0_surf, 4), "\n")
+
+# Portfolio value at T+5 using simulated S and VIX from Section 4
+V_T5_surf <- portfolio_value_surface(S_T5_cop, VIX_T5_cop, rf_mats, rf_vals,
+                                     days1 = 15, days2 = 35, alpha = alpha)
+
+PnL_surf  <- V_T5_surf - V0_surf
+
+VaR95_surf <- -quantile(PnL_surf, 0.05)
+ES95_surf  <- -mean(PnL_surf[PnL_surf <= -VaR95_surf])
+
+cat("\n--- Volatility Surface Risk Measures ---\n")
+cat("VaR 95%:", round(VaR95_surf, 4), "\n")
+cat("ES  95%:", round(ES95_surf, 4), "\n")
+```
+
+```{r section5-pnl-plot}
+hist(PnL_surf, breaks = 80, col = "mistyrose", border = "white",
+     main = "P&L Distribution — Volatility Surface",
+     xlab = "P&L", probability = TRUE)
+abline(v = -VaR95_surf, col = "red", lwd = 2, lty = 2)
+abline(v = -ES95_surf, col = "darkred", lwd = 2, lty = 1)
+legend("topleft", legend = c(paste("VaR 95% =", round(VaR95_surf, 2)),
+                              paste("ES 95%  =", round(ES95_surf, 2))),
+       col = c("red", "darkred"), lwd = 2, lty = c(2, 1))
+```
+
+# 6. Summary & Comparison
+
+```{r summary-table}
+results <- data.frame(
+  Model   = c("Univariate Gaussian", "Bivariate Gaussian",
+               "Copula + Student-t", "Volatility Surface"),
+  VaR_95  = round(c(VaR95_uni, VaR95_biv, VaR95_cop, VaR95_surf), 2),
+  ES_95   = round(c(ES95_uni, ES95_biv, ES95_cop, ES95_surf), 2)
+)
+knitr::kable(results, col.names = c("Model", "VaR 95%", "ES 95%"),
+             caption = "Risk Measures Comparison")
+```
+
+```{r summary-overlay, fig.height=6}
+# Overlay P&L densities
+d_uni  <- density(PnL_uni)
+d_biv  <- density(PnL_biv)
+d_cop  <- density(PnL_cop)
+d_surf <- density(PnL_surf)
+
+xlim <- range(c(d_uni$x, d_biv$x, d_cop$x, d_surf$x))
+ylim <- range(c(d_uni$y, d_biv$y, d_cop$y, d_surf$y))
+
+plot(d_uni, col = "blue", lwd = 2, xlim = xlim, ylim = ylim,
+     main = "P&L Density Comparison", xlab = "P&L")
+lines(d_biv, col = "orange", lwd = 2)
+lines(d_cop, col = "purple", lwd = 2)
+lines(d_surf, col = "darkgreen", lwd = 2)
+legend("topleft",
+       legend = c("Univariate Gaussian", "Bivariate Gaussian",
+                   "Copula + Student-t", "Volatility Surface"),
+       col = c("blue", "orange", "purple", "darkgreen"),
+       lwd = 2)
+```
+
+**Key observations:**
+
+1. The **univariate Gaussian** model only captures delta risk (S&P movements). It ignores
+   volatility changes, leading to potentially understated tail risk.
+
+2. The **bivariate Gaussian** model adds vega risk. The strong negative correlation between
+   S&P returns and VIX ($\rho \approx -0.75$) means that market drops coincide with
+   volatility spikes, which increase option values and partially offset delta losses.
+
+3. The **copula + Student-t** model preserves the same dependence structure but uses heavier
+   tails. This better captures extreme market movements, generally producing more
+   conservative (higher) VaR and ES estimates.
+
+4. The **volatility surface** model assigns option-specific implied volatilities based on
+   moneyness and maturity, rather than using a flat VIX. This captures the smile/skew
+   effect and is the most realistic model.
